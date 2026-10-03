@@ -13,6 +13,7 @@ import type {
   PricingRequest,
   Restaurant
 } from "./types";
+import { pickBestDishMatch, scoreDishName } from "./dish-match";
 import { McpAuthError, McpHttpClient, McpToolError } from "./mcp-client";
 
 function asArray<T>(value: unknown): T[] {
@@ -75,43 +76,6 @@ function variantIdOf(entry: Record<string, unknown>) {
   return firstString(entry.variant_id, entry.variantId);
 }
 
-function pickMenuItem(items: Record<string, unknown>[], dishQuery: string, dietary?: string | null) {
-  if (items.length === 0) {
-    return null;
-  }
-
-  const scored = items
-    .map((entry) => {
-      const name = itemNameOf(entry);
-      let score = scoreText(name, dishQuery);
-      if (dietary === "veg" && entry.is_veg === true) {
-        score += 2;
-      }
-      if (dietary === "non_veg" && entry.is_veg === false) {
-        score += 2;
-      }
-      const price = numberFrom(entry.price ?? entry.min_price ?? entry.item_price ?? entry.display_price, Number.POSITIVE_INFINITY);
-      return { entry, score, price };
-    })
-    .sort((left, right) => {
-      if (right.score !== left.score) {
-        return right.score - left.score;
-      }
-      return left.price - right.price;
-    });
-
-  return scored.find((row) => variantIdOf(row.entry))?.entry ?? scored[0]?.entry ?? null;
-}
-
-function scoreText(haystack: string, query: string) {
-  const tokens = query
-    .toLowerCase()
-    .split(/\W+/)
-    .filter((token) => token.length > 2);
-
-  return tokens.reduce((score, token) => (haystack.toLowerCase().includes(token) ? score + 1 : score), 0);
-}
-
 function pickAddress(addresses: Record<string, unknown>[], location: Location) {
   if (addresses.length === 0) {
     return null;
@@ -121,8 +85,52 @@ function pickAddress(addresses: Record<string, unknown>[], location: Location) {
   return [...addresses].sort((left, right) => {
     const leftText = `${firstString(left.address, left.address_line, left.addressLine, left.name) ?? ""}`;
     const rightText = `${firstString(right.address, right.address_line, right.addressLine, right.name) ?? ""}`;
-    return scoreText(rightText, needle) - scoreText(leftText, needle);
+    return scoreDishName(rightText, needle) - scoreDishName(leftText, needle);
   })[0];
+}
+
+function dietaryBoost(entry: Record<string, unknown>, dietary?: string | null) {
+  if (dietary === "veg" && entry.is_veg === true) {
+    return 4;
+  }
+  if (dietary === "non_veg" && entry.is_veg === false) {
+    return 4;
+  }
+  return 0;
+}
+
+type RankedZomatoPick = {
+  restaurant: Record<string, unknown>;
+  item: Record<string, unknown>;
+  score: number;
+  price: number;
+};
+
+function rankRestaurantItems(
+  restaurant: Record<string, unknown>,
+  items: Record<string, unknown>[],
+  dishQuery: string,
+  dietary?: string | null
+): RankedZomatoPick | null {
+  const restaurantName = itemNameOf(restaurant) || firstString(restaurant.restaurant_name, restaurant.title) || "";
+  const best = pickBestDishMatch(items, dishQuery, itemNameOf, {
+    getPrice: (entry) => numberFrom(entry.price ?? entry.min_price ?? entry.item_price ?? entry.display_price, Number.POSITIVE_INFINITY),
+    isEligible: (entry) => Boolean(variantIdOf(entry)),
+    dietaryBoost: (entry) => dietaryBoost(entry, dietary)
+  });
+
+  if (!best) {
+    return null;
+  }
+
+  // Small boost when restaurant name also overlaps the dish query.
+  const restaurantBoost = Math.min(8, scoreDishName(restaurantName, dishQuery) / 4);
+  return {
+    restaurant,
+    item: best.entry,
+    score: best.score + restaurantBoost,
+    price: best.price
+  };
 }
 
 function extractPricing(cart: Record<string, unknown>, menuPrice: number) {
@@ -288,53 +296,105 @@ export class ZomatoAdapter implements FoodPlatformAdapter {
       page_size: 10
     });
 
-    const restaurants = collectArrays(searchPayload, ["restaurants", "results", "restaurant_list", "data"]);
+    let restaurants = collectArrays(searchPayload, ["restaurants", "results", "restaurant_list", "data"]);
     const preferred = request.intent?.restaurantHint?.toLowerCase();
-    const restaurant =
-      (preferred
-        ? restaurants.find((entry) =>
-            String(entry.name ?? entry.restaurant_name ?? "")
-              .toLowerCase()
-              .includes(preferred)
-          )
-        : undefined) ?? restaurants[0];
+    if (preferred) {
+      const preferredRestaurants = restaurants.filter((entry) =>
+        String(entry.name ?? entry.restaurant_name ?? "")
+          .toLowerCase()
+          .includes(preferred)
+      );
+      if (preferredRestaurants.length > 0) {
+        restaurants = preferredRestaurants;
+      }
+    }
 
+    if (restaurants.length === 0) {
+      throw new McpToolError(`No Zomato restaurants matched "${dishQuery}".`);
+    }
+
+    const candidates: RankedZomatoPick[] = [];
+
+    // First pass: use items already returned by restaurant search (fast + usually relevant).
+    for (const restaurant of restaurants.slice(0, 10)) {
+      const embeddedItems = asArray<Record<string, unknown>>(restaurant.items);
+      if (embeddedItems.length === 0) {
+        continue;
+      }
+      const ranked = rankRestaurantItems(restaurant, embeddedItems, dishQuery, request.intent?.dietary);
+      if (ranked) {
+        candidates.push(ranked);
+      }
+    }
+
+    // Second pass: only if search payloads lacked matching items, pull menus for top restaurants.
+    if (candidates.length === 0) {
+      for (const restaurant of restaurants.slice(0, 5)) {
+        const restaurantIdRaw = firstString(
+          restaurant.res_id,
+          restaurant.restaurant_id,
+          restaurant.id,
+          restaurant.entity_id
+        );
+        const restaurantId =
+          restaurantIdRaw && Number.isFinite(Number(restaurantIdRaw))
+            ? Number(restaurantIdRaw)
+            : restaurantIdRaw;
+        if (restaurantId == null || restaurantId === "") {
+          continue;
+        }
+
+        const listingPayload = await client
+          .callTool("get_menu_items_listing", { res_id: restaurantId, address_id: addressId })
+          .catch(() => null);
+        const menuItems = listingPayload
+          ? collectArrays(listingPayload, [
+              "items",
+              "item_mappings",
+              "menu",
+              "dishes",
+              "menu_items",
+              "results",
+              "data"
+            ])
+          : [];
+
+        const ranked = rankRestaurantItems(restaurant, menuItems, dishQuery, request.intent?.dietary);
+        if (ranked) {
+          candidates.push(ranked);
+        }
+      }
+    }
+
+    candidates.sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      return left.price - right.price;
+    });
+
+    const best = candidates[0];
+    if (!best) {
+      throw new McpToolError(
+        `No Zomato menu items closely matched "${dishQuery}". Try a more specific dish name.`
+      );
+    }
+
+    const restaurant = best.restaurant;
+    const matched = best.item;
     const restaurantIdRaw = firstString(
-      restaurant?.res_id,
-      restaurant?.restaurant_id,
-      restaurant?.id,
-      restaurant?.entity_id
+      restaurant.res_id,
+      restaurant.restaurant_id,
+      restaurant.id,
+      restaurant.entity_id
     );
     const restaurantId =
       restaurantIdRaw && Number.isFinite(Number(restaurantIdRaw)) ? Number(restaurantIdRaw) : restaurantIdRaw;
     const restaurantName =
-      firstString(restaurant?.name, restaurant?.restaurant_name, restaurant?.title) || "Zomato restaurant";
+      firstString(restaurant.name, restaurant.restaurant_name, restaurant.title) || "Zomato restaurant";
 
     if (restaurantId == null || restaurantId === "") {
       throw new McpToolError(`No Zomato restaurants matched "${dishQuery}".`);
-    }
-
-    let menuItems = asArray<Record<string, unknown>>(restaurant?.items);
-    if (menuItems.length === 0) {
-      const listingPayload = await client
-        .callTool("get_menu_items_listing", { res_id: restaurantId, address_id: addressId })
-        .catch(() => null);
-      menuItems = listingPayload
-        ? collectArrays(listingPayload, [
-            "items",
-            "item_mappings",
-            "menu",
-            "dishes",
-            "menu_items",
-            "results",
-            "data"
-          ])
-        : [];
-    }
-
-    const matched = pickMenuItem(menuItems, dishQuery, request.intent?.dietary);
-    if (!matched) {
-      throw new McpToolError(`No Zomato menu items matched "${dishQuery}".`);
     }
 
     const variantId = variantIdOf(matched);
@@ -379,6 +439,7 @@ export class ZomatoAdapter implements FoodPlatformAdapter {
           itemId: firstString(matched.catalogue_id, matched.item_id, matched.id, matched.dish_id) ?? null,
           addressId,
           dishQuery,
+          matchScore: best.score,
           intent: request.intent ?? null
         }
       }

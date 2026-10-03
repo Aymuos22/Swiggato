@@ -14,6 +14,7 @@ import type {
   Restaurant
 } from "./types";
 import { McpAuthError, McpHttpClient, McpToolError } from "./mcp-client";
+import { pickBestDishMatch } from "./dish-match";
 
 type SwiggyAddress = {
   id: string;
@@ -323,7 +324,17 @@ export class SwiggyAdapter implements FoodPlatformAdapter {
       throw new McpToolError(`No in-stock Swiggy menu matches for "${dishQuery}".`);
     }
 
-    const item = items[0];
+    const best = pickBestDishMatch(items, dishQuery, (item) => item.name, {
+      getPrice: (item) => Number(item.price ?? Number.POSITIVE_INFINITY)
+    });
+
+    if (!best) {
+      throw new McpToolError(
+        `No Swiggy menu items closely matched "${dishQuery}". Try a more specific dish name.`
+      );
+    }
+
+    const item = best.entry;
     await client.callTool("update_food_cart", {
       restaurantId: item.restaurant_id,
       restaurantName: item.restaurant_name,
@@ -378,6 +389,7 @@ export class SwiggyAdapter implements FoodPlatformAdapter {
           restaurantId: item.restaurant_id,
           menuItemId: item.menu_item_id,
           dishQuery,
+          matchScore: best.score,
           intent: request.intent ?? null,
           coupon: offers?.coupon_applied ?? null
         }

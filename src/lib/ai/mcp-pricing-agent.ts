@@ -276,17 +276,22 @@ Dish: ${dish}
 Dietary: ${intent?.dietary ?? "any"}
 Pick address near: ${location.label ?? "Home"} / ${location.address ?? ""}
 Rules:
-- Always choose the best matching dish yourself (prefer cheapest sensible match).
+- Only pick an item whose name clearly matches the dish (${dish}). Never substitute an unrelated item (e.g. dessert for a curry/meal).
+- Prefer the best name match first, then cheapest among close matches.
 - Always use payment_type "cash_on_delivery". Never ask about payment.
 - create_cart items must use variant_id (starts with "v_"), not item_id/catalogue_id.
 - Flow: get_saved_addresses_for_user → get_restaurants_for_keyword → create_cart → ${SUBMIT_TOOL}.
 - If restaurant.items already includes a matching variant_id, skip menu listing.
+- If nothing matches the dish name, fail instead of submitting a random item.
 - No lat/lng args. No checkout. Only tool calls + ${SUBMIT_TOOL}.`;
   }
 
   return `Swiggy pricing agent. You are fully autonomous — never ask the user questions.
 Dish: ${dish}
 Address hint: ${location.label ?? "Home"} / ${location.address ?? ""}
+Rules:
+- Only pick menu items whose names clearly match "${dish}".
+- Prefer best name match, then cheapest close match.
 Flow: get_addresses → search_menu → update_food_cart → get_food_cart → flush_food_cart → ${SUBMIT_TOOL}.`;
 }
 

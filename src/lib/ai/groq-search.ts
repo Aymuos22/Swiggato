@@ -66,7 +66,7 @@ export async function parseNaturalLanguageSearch(rawQuery: string): Promise<Sear
           {
             role: "system",
             content:
-              "Convert Indian food-delivery requests to JSON keys: dishQuery, cuisine, dietary (veg|non_veg|egg|any|null), restaurantHint, maxFinalPrice, preferences, clarifiedQuery. dishQuery is a short menu search string."
+              "Convert Indian food-delivery requests to JSON keys: dishQuery, cuisine, dietary (veg|non_veg|egg|any|null), restaurantHint, maxFinalPrice, preferences, clarifiedQuery. dishQuery must be a short, specific menu item search string (e.g. 'chicken biryani', 'punjabi chole'), never a dessert/snack substitute for a savory request."
           },
           {
             role: "user",
